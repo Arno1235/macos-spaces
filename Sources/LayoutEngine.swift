@@ -242,22 +242,22 @@ final class LayoutEngine {
         try? await Task.sleep(nanoseconds: 300_000_000)
 
         for saved in unmatched {
-            let existingIDs = Set(capturableWindows(includeAX: false).map(\.windowID))
+            let knownIDs = Set(capturableWindows(includeAX: false).map(\.windowID)).union(used)
             openNewWindow(for: saved)
-            launched += 1
             if let created = await waitForNewWindow(
                 bundleID: saved.bundleID,
-                excluding: existingIDs.union(used),
-                on: space,
-                timeout: 4
+                excluding: knownIDs,
+                timeout: 5
             ) {
+                WindowSpaceMover.move([created.windowID], to: space.managedID, connection: connection)
                 used.insert(created.windowID)
                 assignments.append((saved, created))
             }
         }
         if !unmatched.isEmpty {
-            await switchTo(space)
             try? await Task.sleep(nanoseconds: 250_000_000)
+            await switchTo(space)
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
         let stillElsewhere = assignments.filter { assignment in
@@ -285,10 +285,8 @@ final class LayoutEngine {
                 setMinimized(element, saved.minimized)
                 setFrame(element, saved.frame)
                 AXUIElementPerformAction(element, kAXRaiseAction as CFString)
-                placed += 1
-            } else if liveWindow.spaceIDs.contains(space.managedID) {
-                placed += 1
             }
+            placed += 1
         }
 
         let missed = max(0, layout.windows.count - placed)
@@ -329,7 +327,7 @@ final class LayoutEngine {
 
     private func openNewWindow(for saved: SavedWindow) {
         if saved.bundleID == "com.apple.finder" {
-            openFinderWindow(document: saved.document)
+            openFinderWindow(saved)
             return
         }
         if Self.browserBundleIDs.contains(saved.bundleID) {
@@ -347,24 +345,74 @@ final class LayoutEngine {
         NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in }
     }
 
-    private func openFinderWindow(document: String?) {
-        if let document, let url = URL(string: document), url.isFileURL {
-            let path = url.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            if runAppleScript("""
-                tell application "Finder"
-                    set newWin to make new Finder window
-                    try
-                        set target of newWin to POSIX file "\(path)"
-                    end try
-                end tell
-                """) { return }
+    private func openFinderWindow(_ saved: SavedWindow) {
+        if let pid = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "com.apple.finder"
+        })?.processIdentifier, pressNewWindowMenu(pid: pid) {
+            setFinderFrontWindow(to: folderURL(for: saved))
+            return
+        }
+        if let folder = folderURL(for: saved),
+           runAppleScript("""
+            tell application "Finder"
+                set newWin to make new Finder window
+                try
+                    set target of newWin to POSIX file "\(appleScriptPath(folder))"
+                end try
+            end tell
+            """) {
+            return
         }
         if runAppleScript("""
             tell application "Finder"
                 make new Finder window
             end tell
-            """) { return }
-        postCommandN()
+            """) {
+            setFinderFrontWindow(to: folderURL(for: saved))
+            return
+        }
+        if let finder = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "com.apple.finder"
+        }) {
+            finder.activate()
+            usleep(150_000)
+            postCommandN()
+            setFinderFrontWindow(to: folderURL(for: saved))
+            return
+        }
+        if let folder = folderURL(for: saved) {
+            NSWorkspace.shared.open(folder)
+        }
+    }
+
+    private func setFinderFrontWindow(to folder: URL?) {
+        guard let folder else { return }
+        _ = runAppleScript("""
+            tell application "Finder"
+                try
+                    set target of front window to POSIX file "\(appleScriptPath(folder))"
+                end try
+            end tell
+            """)
+    }
+
+    private func folderURL(for saved: SavedWindow) -> URL? {
+        if let document = saved.document, let url = URL(string: document), url.isFileURL {
+            return url
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        if saved.title == home.lastPathComponent { return home }
+        guard !saved.title.isEmpty else { return nil }
+        let nested = home.appendingPathComponent(saved.title)
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: nested.path, isDirectory: &isDir), isDir.boolValue {
+            return nested
+        }
+        return nil
+    }
+
+    private func appleScriptPath(_ url: URL) -> String {
+        url.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     private func openBrowserWindow(bundleID: String) {
@@ -409,6 +457,8 @@ final class LayoutEngine {
             if titles.count == 1 {
                 return AXUIElementPerformAction(child, kAXPressAction as CFString) == .success
             }
+            _ = AXUIElementPerformAction(child, kAXPressAction as CFString)
+            usleep(80_000)
             let nested: [AXUIElement] = axValue(child, kAXChildrenAttribute as String) ?? []
             for menu in nested where pressMenu(menu, titles: Array(titles.dropFirst())) {
                 return true
@@ -430,17 +480,15 @@ final class LayoutEngine {
     private func waitForNewWindow(
         bundleID: String,
         excluding used: Set<CGWindowID>,
-        on space: Space,
         timeout: TimeInterval
     ) async -> LiveWindow? {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let created = capturableWindows(includeAX: false).first(where: {
-                $0.bundleID == bundleID
-                    && !used.contains($0.windowID)
-                    && ($0.spaceIDs.contains(space.managedID) || $0.spaceIDs.isEmpty)
-            }) {
-                return created
+            let created = capturableWindows(includeAX: false).filter {
+                $0.bundleID == bundleID && !used.contains($0.windowID)
+            }
+            if let window = created.max(by: { $0.windowID < $1.windowID }) {
+                return window
             }
             try? await Task.sleep(nanoseconds: 120_000_000)
         }
@@ -629,7 +677,7 @@ final class LayoutEngine {
                 spaceIDs: spacesContainingWindow(connection, windowID),
                 element: ax,
                 pid: pid,
-                document: ax.flatMap { axString($0, kAXDocumentAttribute as String) }
+                document: ax.flatMap(axDocument)
             ))
         }
 
@@ -659,7 +707,9 @@ final class LayoutEngine {
         let ranked = pool.map { window -> (LiveWindow, Int) in
             (window, score(window, saved: saved, space: space))
         }
-        let strong = ranked.filter { $0.1 >= 2 }
+        let strong = ranked.filter { pair in
+            pair.1 >= 2 || (!reuseExisting && !preexistingIDs.contains(pair.0.windowID))
+        }
         return strong.max { lhs, rhs in
             if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
             return frameDistance(lhs.0.frame, saved.frame) > frameDistance(rhs.0.frame, saved.frame)
@@ -730,6 +780,18 @@ final class LayoutEngine {
 
     private func axString(_ element: AXUIElement, _ attribute: String) -> String? {
         axValue(element, attribute)
+    }
+
+    private func axDocument(_ element: AXUIElement) -> String? {
+        if let text = axString(element, kAXDocumentAttribute as String), !text.isEmpty {
+            return text
+        }
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXDocumentAttribute as CFString, &ref) == .success else {
+            return nil
+        }
+        if let url = ref as? URL { return url.absoluteString }
+        return nil
     }
 
     private func axBool(_ element: AXUIElement, _ attribute: String) -> Bool? {
