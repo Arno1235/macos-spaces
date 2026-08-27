@@ -184,9 +184,9 @@ final class LayoutEngine {
         _ layout: SavedLayout,
         onto space: Space,
         allSpaces: [Space],
-        switchTo: @escaping (Space) -> Void
+        switchTo: @escaping (Space) async -> Void
     ) async -> RestoreResult {
-        await MainActor.run { switchTo(space) }
+        await switchTo(space)
         try? await Task.sleep(nanoseconds: 350_000_000)
 
         var launched = 0
@@ -221,7 +221,7 @@ final class LayoutEngine {
 
         WindowSpaceMover.move(assignments.map(\.live.windowID), to: space.managedID, connection: connection)
         try? await Task.sleep(nanoseconds: 350_000_000)
-        await MainActor.run { switchTo(space) }
+        await switchTo(space)
         try? await Task.sleep(nanoseconds: 300_000_000)
 
         let matchedBundles = Set(assignments.map(\.saved.bundleID))
@@ -252,7 +252,7 @@ final class LayoutEngine {
         }
         if !stillElsewhere.isEmpty {
             await dragWindowsOntoSpace(stillElsewhere.map(\.live), target: space, allSpaces: allSpaces, switchTo: switchTo)
-            await MainActor.run { switchTo(space) }
+            await switchTo(space)
             try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
@@ -352,7 +352,7 @@ final class LayoutEngine {
         _ windows: [LiveWindow],
         target: Space,
         allSpaces: [Space],
-        switchTo: @escaping (Space) -> Void
+        switchTo: @escaping (Space) async -> Void
     ) async {
         var remaining = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0) })
         var byKnownSpace: [CGSSpaceID: [LiveWindow]] = [:]
@@ -366,7 +366,7 @@ final class LayoutEngine {
         }
 
         for space in allSpaces where !unknown.isEmpty && space.managedID != target.managedID {
-            await MainActor.run { switchTo(space) }
+            await switchTo(space)
             try? await Task.sleep(nanoseconds: 280_000_000)
             var found: [LiveWindow] = []
             for window in unknown {
@@ -397,9 +397,9 @@ final class LayoutEngine {
         _ window: LiveWindow,
         from source: Space,
         to target: Space,
-        switchTo: @escaping (Space) -> Void
+        switchTo: @escaping (Space) async -> Void
     ) async {
-        await MainActor.run { switchTo(source) }
+        await switchTo(source)
         try? await Task.sleep(nanoseconds: 320_000_000)
 
         guard let element = axWindows(pid: window.pid)[window.windowID] ?? window.element else { return }
@@ -415,7 +415,7 @@ final class LayoutEngine {
         postMouse(.leftMouseDragged, at: CGPoint(x: quartz.x + 4, y: quartz.y))
         try? await Task.sleep(nanoseconds: 50_000_000)
 
-        await MainActor.run { switchTo(target) }
+        await switchTo(target)
         try? await Task.sleep(nanoseconds: 400_000_000)
         postMouse(.leftMouseUp, at: quartzPoint(fromCocoa: grabPoint(for: frame)))
         try? await Task.sleep(nanoseconds: 80_000_000)

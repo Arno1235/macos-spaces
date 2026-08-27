@@ -23,9 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.service.rename(space, to: name)
         }
         panel.model.onSelect = { [weak self] space in
-            self?.panel.close()
-            self?.frozenFocusedUUID = nil
-            self?.service.select(space)
+            guard let self else { return }
+            self.panel.close()
+            self.frozenFocusedUUID = nil
+            guard self.ensureAccessibility() else { return }
+            Task { @MainActor in
+                await self.service.select(space)
+            }
         }
         panel.model.onSave = { [weak self] space in
             self?.saveLayout(of: space)
@@ -97,7 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onto: space,
                 allSpaces: service.snapshot.allSpaces
             ) { [weak self] target in
-                self?.service.select(target)
+                await self?.service.select(target)
             }
             flashStatus(result.message, seconds: 4)
         }
@@ -133,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onto: target,
                 allSpaces: service.snapshot.allSpaces
             ) { [weak self] space in
-                self?.service.select(space)
+                await self?.service.select(space)
             }
             refreshLayoutState()
             if created != nil {
@@ -160,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Spaces needs Accessibility permission"
         alert.informativeText = """
-        Restore and Reopen need permission to move windows and create desktops.
+        Switching Spaces, Restore, and Reopen need permission to drive Mission Control and move windows.
 
         In System Settings → Privacy & Security → Accessibility:
         1. If Spaces is already listed, turn it off, select it, and click −.

@@ -93,15 +93,45 @@ final class SpaceService: ObservableObject {
         return nil
     }
 
-    func select(_ space: Space) {
-        let needsSwitch = !space.isCurrentOnDisplay
-        if needsSwitch {
-            CGSManagedDisplaySetCurrentSpace(connection, space.displayID as CFString, space.managedID)
+    @MainActor
+    func select(_ space: Space) async {
+        await switchTo(space)
+        refresh(force: true)
+    }
+
+    @MainActor
+    private func switchTo(_ space: Space) async {
+        let live = readSnapshot()
+        let mouse = NSEvent.mouseLocation
+        let onTargetDisplay = NSScreen.screens.first(where: { $0.displayUUID == space.displayID })?.frame.contains(mouse) == true
+        if !onTargetDisplay {
+            SpaceSwitcher.focusDisplay(space.displayID)
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
-        let delay: TimeInterval = needsSwitch ? 0.08 : 0
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.activateWindow(onDisplay: space.displayID)
-            self?.refresh(force: true)
+
+        let currentID = CGSManagedDisplayGetCurrentSpace(connection, space.displayID as CFString)
+        guard currentID != space.managedID else { return }
+
+        let ordered = live.displays.first(where: { $0.id == space.displayID })?.spaces
+            ?? live.allSpaces.filter { $0.displayID == space.displayID }
+        guard let from = ordered.firstIndex(where: { $0.managedID == currentID }),
+              let to = ordered.firstIndex(where: { $0.managedID == space.managedID })
+        else { return }
+
+        let steps = to - from
+        for _ in 0..<abs(steps) {
+            let before = CGSManagedDisplayGetCurrentSpace(connection, space.displayID as CFString)
+            await SpaceSwitcher.move(steps: steps > 0 ? 1 : -1)
+            for _ in 0..<24 {
+                if CGSManagedDisplayGetCurrentSpace(connection, space.displayID as CFString) != before {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+        }
+
+        if !onTargetDisplay {
+            SpaceSwitcher.restoreCursor(to: mouse)
         }
     }
 
@@ -192,36 +222,5 @@ final class SpaceService: ObservableObject {
             return NSScreen.screens.first?.localizedName ?? "Built-in Display"
         }
         return "Display \(fallbackIndex + 1)"
-    }
-
-    private func activateWindow(onDisplay displayUUID: String) {
-        guard let screen = NSScreen.screens.first(where: { $0.displayUUID == displayUUID }) else { return }
-        let targetDisplay = screen.cgDisplayID
-        let selfPID = ProcessInfo.processInfo.processIdentifier
-
-        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return
-        }
-
-        for window in windows {
-            guard (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
-                  let pid = window[kCGWindowOwnerPID as String] as? pid_t,
-                  pid != selfPID,
-                  let owner = window[kCGWindowOwnerName as String] as? String,
-                  owner != "Window Server",
-                  owner != "Dock",
-                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
-                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary),
-                  rect.width > 80, rect.height > 80
-            else { continue }
-
-            var count: UInt32 = 0
-            var ids = [CGDirectDisplayID](repeating: 0, count: 8)
-            CGGetDisplaysWithRect(rect, 8, &ids, &count)
-            guard ids.prefix(Int(count)).contains(targetDisplay) else { continue }
-
-            NSRunningApplication(processIdentifier: pid)?.activate()
-            return
-        }
     }
 }
