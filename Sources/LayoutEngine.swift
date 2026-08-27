@@ -11,6 +11,7 @@ struct SavedWindow: Codable, Equatable {
     var width: Double
     var height: Double
     var minimized: Bool
+    var document: String?
 
     var frame: CGRect {
         CGRect(x: x, y: y, width: width, height: height)
@@ -165,7 +166,8 @@ final class LayoutEngine {
                 y: window.frame.origin.y,
                 width: window.frame.size.width,
                 height: window.frame.size.height,
-                minimized: window.minimized
+                minimized: window.minimized,
+                document: window.document
             )
         }
 
@@ -184,10 +186,15 @@ final class LayoutEngine {
         _ layout: SavedLayout,
         onto space: Space,
         allSpaces: [Space],
+        reuseExisting: Bool = true,
         switchTo: @escaping (Space) async -> Void
     ) async -> RestoreResult {
         await switchTo(space)
         try? await Task.sleep(nanoseconds: 350_000_000)
+
+        let preexistingIDs: Set<CGWindowID> = reuseExisting
+            ? []
+            : Set(capturableWindows(includeAX: false).map(\.windowID))
 
         var launched = 0
         var launchedIDs: Set<String> = []
@@ -210,12 +217,22 @@ final class LayoutEngine {
 
         var used = Set<CGWindowID>()
         var assignments: [(saved: SavedWindow, live: LiveWindow)] = []
-        var live = capturableWindows(includeAX: false)
+        var unmatched: [SavedWindow] = []
+        let live = capturableWindows(includeAX: true)
 
         for saved in layout.windows {
-            if let match = matchWindow(saved, among: live, on: space, excluding: used) {
+            if let match = matchWindow(
+                saved,
+                among: live,
+                on: space,
+                excluding: used,
+                reuseExisting: reuseExisting,
+                preexistingIDs: preexistingIDs
+            ) {
                 used.insert(match.windowID)
                 assignments.append((saved, match))
+            } else {
+                unmatched.append(saved)
             }
         }
 
@@ -224,22 +241,23 @@ final class LayoutEngine {
         await switchTo(space)
         try? await Task.sleep(nanoseconds: 300_000_000)
 
-        let matchedBundles = Set(assignments.map(\.saved.bundleID))
-        let missingBundles = layout.bundleIDs.filter { !matchedBundles.contains($0) }
-        for bundleID in missingBundles {
-            openOnCurrentSpace(bundleID: bundleID)
+        for saved in unmatched {
+            let existingIDs = Set(capturableWindows(includeAX: false).map(\.windowID))
+            openNewWindow(for: saved)
             launched += 1
-        }
-        if !missingBundles.isEmpty {
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            live = capturableWindows(includeAX: false)
-            let assignedSaved = Set(assignments.map(\.saved.windowID))
-            for saved in layout.windows where !assignedSaved.contains(saved.windowID) {
-                if let match = matchWindow(saved, among: live, on: space, excluding: used) {
-                    used.insert(match.windowID)
-                    assignments.append((saved, match))
-                }
+            if let created = await waitForNewWindow(
+                bundleID: saved.bundleID,
+                excluding: existingIDs.union(used),
+                on: space,
+                timeout: 4
+            ) {
+                used.insert(created.windowID)
+                assignments.append((saved, created))
             }
+        }
+        if !unmatched.isEmpty {
+            await switchTo(space)
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
 
         let stillElsewhere = assignments.filter { assignment in
@@ -306,24 +324,127 @@ final class LayoutEngine {
         let spaceIDs: [CGSSpaceID]
         let element: AXUIElement?
         let pid: pid_t
+        let document: String?
     }
 
-    private func openOnCurrentSpace(bundleID: String) {
-        if bundleID == "com.google.Chrome" {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            proc.arguments = ["-a", "Google Chrome", "--args", "--new-window"]
-            try? proc.run()
+    private func openNewWindow(for saved: SavedWindow) {
+        if saved.bundleID == "com.apple.finder" {
+            openFinderWindow(document: saved.document)
             return
         }
-        if bundleID == "com.apple.finder" {
-            NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser)
+        if Self.browserBundleIDs.contains(saved.bundleID) {
+            openBrowserWindow(bundleID: saved.bundleID)
             return
         }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
+        if let pid = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == saved.bundleID })?.processIdentifier {
+            if pressNewWindowMenu(pid: pid) { return }
+            postCommandN()
+            return
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: saved.bundleID) else { return }
         let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
+        config.activates = false
         NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in }
+    }
+
+    private func openFinderWindow(document: String?) {
+        if let document, let url = URL(string: document), url.isFileURL {
+            let path = url.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            if runAppleScript("""
+                tell application "Finder"
+                    set newWin to make new Finder window
+                    try
+                        set target of newWin to POSIX file "\(path)"
+                    end try
+                end tell
+                """) { return }
+        }
+        if runAppleScript("""
+            tell application "Finder"
+                make new Finder window
+            end tell
+            """) { return }
+        postCommandN()
+    }
+
+    private func openBrowserWindow(bundleID: String) {
+        if bundleID == "com.apple.Safari" {
+            _ = runAppleScript("""
+                tell application "Safari"
+                    make new document
+                end tell
+                """)
+            return
+        }
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = ["-a", appURL.path, "--args", "--new-window"]
+        try? proc.run()
+    }
+
+    private func runAppleScript(_ source: String) -> Bool {
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        return error == nil
+    }
+
+    private func pressNewWindowMenu(pid: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        guard let menuBar: AXUIElement = axValue(app, kAXMenuBarAttribute as String) else { return false }
+        let names = [
+            ["File", "New Finder Window"],
+            ["File", "New Window"],
+            ["File", "New"],
+        ]
+        return names.contains { pressMenu(menuBar, titles: $0) }
+    }
+
+    private func pressMenu(_ root: AXUIElement, titles: [String]) -> Bool {
+        guard let title = titles.first else { return false }
+        let children: [AXUIElement] = axValue(root, kAXChildrenAttribute as String) ?? []
+        for child in children {
+            let childTitle = axString(child, kAXTitleAttribute as String) ?? ""
+            guard childTitle.compare(title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame else { continue }
+            if titles.count == 1 {
+                return AXUIElementPerformAction(child, kAXPressAction as CFString) == .success
+            }
+            let nested: [AXUIElement] = axValue(child, kAXChildrenAttribute as String) ?? []
+            for menu in nested where pressMenu(menu, titles: Array(titles.dropFirst())) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func postCommandN() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(keyboardEventSource: source, virtualKey: 45, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: 45, keyDown: false)
+        down?.flags = .maskCommand
+        up?.flags = .maskCommand
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+    }
+
+    private func waitForNewWindow(
+        bundleID: String,
+        excluding used: Set<CGWindowID>,
+        on space: Space,
+        timeout: TimeInterval
+    ) async -> LiveWindow? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let created = capturableWindows(includeAX: false).first(where: {
+                $0.bundleID == bundleID
+                    && !used.contains($0.windowID)
+                    && ($0.spaceIDs.contains(space.managedID) || $0.spaceIDs.isEmpty)
+            }) {
+                return created
+            }
+            try? await Task.sleep(nanoseconds: 120_000_000)
+        }
+        return nil
     }
 
     private func axElement(pid: pid_t, windowID: CGWindowID, title: String, frame: CGRect) -> AXUIElement? {
@@ -507,7 +628,8 @@ final class LayoutEngine {
                 minimized: minimized,
                 spaceIDs: spacesContainingWindow(connection, windowID),
                 element: ax,
-                pid: pid
+                pid: pid,
+                document: ax.flatMap { axString($0, kAXDocumentAttribute as String) }
             ))
         }
 
@@ -525,22 +647,30 @@ final class LayoutEngine {
         _ saved: SavedWindow,
         among candidates: [LiveWindow],
         on space: Space,
-        excluding used: Set<CGWindowID>
+        excluding used: Set<CGWindowID>,
+        reuseExisting: Bool,
+        preexistingIDs: Set<CGWindowID>
     ) -> LiveWindow? {
-        let pool = candidates.filter { $0.bundleID == saved.bundleID && !used.contains($0.windowID) }
-        guard !pool.isEmpty else { return nil }
-        return pool.max { lhs, rhs in
-            let left = score(lhs, saved: saved, space: space)
-            let right = score(rhs, saved: saved, space: space)
-            if left != right { return left < right }
-            return frameDistance(lhs.frame, saved.frame) > frameDistance(rhs.frame, saved.frame)
+        var pool = candidates.filter { $0.bundleID == saved.bundleID && !used.contains($0.windowID) }
+        if !reuseExisting {
+            pool = pool.filter { $0.spaceIDs.contains(space.managedID) || !preexistingIDs.contains($0.windowID) }
         }
+        guard !pool.isEmpty else { return nil }
+        let ranked = pool.map { window -> (LiveWindow, Int) in
+            (window, score(window, saved: saved, space: space))
+        }
+        let strong = ranked.filter { $0.1 >= 2 }
+        return strong.max { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            return frameDistance(lhs.0.frame, saved.frame) > frameDistance(rhs.0.frame, saved.frame)
+        }?.0
     }
 
     private func score(_ window: LiveWindow, saved: SavedWindow, space: Space) -> Int {
-        var value = 1
+        var value = 0
         if window.windowID == saved.windowID { value += 8 }
         if !saved.title.isEmpty, window.title == saved.title { value += 4 }
+        if let document = saved.document, !document.isEmpty, window.document == document { value += 4 }
         if window.spaceIDs.contains(space.managedID) { value += 2 }
         return value
     }
@@ -553,6 +683,16 @@ final class LayoutEngine {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
     }
+
+    private static let browserBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "com.brave.Browser",
+        "com.apple.Safari",
+        "com.microsoft.edgemac",
+        "company.thebrowser.Browser",
+        "org.mozilla.firefox",
+    ]
 
     private static let ignoredBundleIDs: Set<String> = [
         "com.apple.dock",

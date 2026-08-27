@@ -135,7 +135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = await layouts.restore(
                 layout,
                 onto: target,
-                allSpaces: service.snapshot.allSpaces
+                allSpaces: service.snapshot.allSpaces,
+                reuseExisting: false
             ) { [weak self] space in
                 await self?.service.select(space)
             }

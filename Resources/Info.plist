@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Spaces opens extra Finder and browser windows when restoring a saved Space.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
