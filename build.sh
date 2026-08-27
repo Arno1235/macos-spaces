@@ -19,6 +19,7 @@ swiftc -O \
   -framework AppKit \
   -framework SwiftUI \
   -framework ServiceManagement \
+  -framework ApplicationServices \
   -o "$MACOS/Spaces" \
   "$ROOT"/Sources/*.swift
 

@@ -4,17 +4,57 @@ import SwiftUI
 final class PanelModel: ObservableObject {
     @Published var snapshot = SpaceSnapshot()
     @Published var loginEnabled = LoginItem.isEnabled
+    @Published var liveApps: [String: [String]] = [:]
+    @Published var savedLayouts: [String: LayoutSummary] = [:]
+    @Published var statusMessage: String?
 
     var onRename: ((Space, String) -> Void)?
     var onSelect: ((Space) -> Void)?
+    var onSave: ((Space) -> Void)?
+    var onRestore: ((Space) -> Void)?
     var onToggleLogin: (() -> Void)?
     var onQuit: (() -> Void)?
 }
 
+struct AppIconStack: View {
+    let bundleIDs: [String]
+    var size: CGFloat = 14
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(Array(bundleIDs.prefix(4)), id: \.self) { id in
+                AppIcon(bundleID: id, size: size)
+            }
+            if bundleIDs.count > 4 {
+                Text("+\(bundleIDs.count - 4)")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct AppIcon: View {
+    let bundleID: String
+    var size: CGFloat = 14
+
+    var body: some View {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: url.path))
+                .resizable()
+                .frame(width: size, height: size)
+        }
+    }
+}
+
 struct SpaceRow: View {
     let space: Space
+    let liveApps: [String]
+    let saved: LayoutSummary?
     let onRename: (String) -> Void
     let onSelect: () -> Void
+    let onSave: () -> Void
+    let onRestore: () -> Void
 
     @State private var draft = ""
     @FocusState private var fieldFocused: Bool
@@ -37,6 +77,8 @@ struct SpaceRow: View {
                 .onSubmit { commit() }
                 .onExitCommand { fieldFocused = false; commit() }
 
+            AppIconStack(bundleIDs: liveApps)
+
             if space.isFocused {
                 Text("Focus")
                     .font(.system(size: 9, weight: .semibold))
@@ -44,7 +86,27 @@ struct SpaceRow: View {
                     .padding(.vertical, 2)
                     .background(Capsule().fill(Color.accentColor.opacity(0.25)))
                     .foregroundStyle(Color.accentColor)
-            } else {
+            }
+
+            Button(action: onSave) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(saved.map { "Replace saved layout (\($0.windowCount) windows)" } ?? "Save apps and window layout")
+
+            if saved != nil {
+                Button(action: onRestore) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(restoreHelp)
+            }
+
+            if !space.isFocused {
                 Button(action: onSelect) {
                     Image(systemName: "arrow.right.circle")
                         .font(.system(size: 13))
@@ -57,7 +119,7 @@ struct SpaceRow: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(space.isFocused ? Color.accentColor.opacity(0.14) : Color.clear)
         )
         .onAppear { draft = space.customName ?? "" }
@@ -69,6 +131,13 @@ struct SpaceRow: View {
         .onChange(of: fieldFocused) { _, focused in
             if !focused { commit() }
         }
+    }
+
+    private var restoreHelp: String {
+        guard let saved else { return "Restore layout" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return "Restore \(saved.windowCount) windows · saved \(formatter.localizedString(for: saved.savedAt, relativeTo: Date()))"
     }
 
     private var indicatorSymbol: String {
@@ -94,6 +163,8 @@ struct SpaceRow: View {
 struct SpacesPanelView: View {
     @ObservedObject var model: PanelModel
 
+    private let cornerRadius: CGFloat = 14
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
@@ -111,16 +182,29 @@ struct SpacesPanelView: View {
 
             footer
         }
-        .padding(12)
-        .frame(width: 320)
-        .background(Color.clear)
+        .padding(14)
+        .frame(width: 340)
+        .background {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(.regularMaterial)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("Spaces")
                 .font(.system(size: 15, weight: .semibold))
-            if let focused = model.snapshot.focusedSpace {
+            if let status = model.statusMessage {
+                Text(status)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.accentColor)
+                    .lineLimit(2)
+            } else if let focused = model.snapshot.focusedSpace {
                 Text(focused.displayName)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
@@ -148,15 +232,24 @@ struct SpacesPanelView: View {
             ForEach(display.spaces) { space in
                 SpaceRow(
                     space: space,
+                    liveApps: model.liveApps[space.uuid] ?? [],
+                    saved: model.savedLayouts[space.uuid],
                     onRename: { model.onRename?(space, $0) },
-                    onSelect: { model.onSelect?(space) }
+                    onSelect: { model.onSelect?(space) },
+                    onSave: { model.onSave?(space) },
+                    onRestore: { model.onRestore?(space) }
                 )
             }
         }
     }
 
     private var footer: some View {
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Save stores the apps and window layout on that Space. Restore launches them again.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
             Button {
                 model.onToggleLogin?()
                 model.loginEnabled = LoginItem.isEnabled
@@ -191,6 +284,35 @@ struct SpacesPanelView: View {
 
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
+}
+
+final class TransparentHostingView<Content: View>: NSHostingView<Content> {
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+        configure()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configure()
+    }
+
+    override func layout() {
+        super.layout()
+        configure()
+    }
+
+    private func configure() {
+        wantsLayer = true
+        layer?.isOpaque = false
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.masksToBounds = false
+    }
 }
 
 final class PanelController: NSObject {
@@ -240,16 +362,13 @@ final class PanelController: NSObject {
         onWillOpen?()
         model.loginEnabled = LoginItem.isEnabled
 
-        let hosting = NSHostingView(rootView: SpacesPanelView(model: model))
-        hosting.wantsLayer = true
-        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        let hosting = TransparentHostingView(rootView: SpacesPanelView(model: model))
+        hosting.sizingOptions = [.intrinsicContentSize]
 
-        let width: CGFloat = 320
-        hosting.frame.size = NSSize(width: width, height: 800)
-        hosting.layoutSubtreeIfNeeded()
-        let fitted = hosting.fittingSize.height
+        let width: CGFloat = 340
+        let fitted = hosting.fittingSize
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
-        let height = min(max(fitted > 1 ? fitted : 360, 180), screen.visibleFrame.height - 24)
+        let height = min(max(fitted.height > 1 ? fitted.height : 380, 180), screen.visibleFrame.height - 24)
 
         let panel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -264,21 +383,11 @@ final class PanelController: NSObject {
         panel.collectionBehavior = [.moveToActiveSpace, .ignoresCycle]
         panel.isMovable = false
         panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = true
 
-        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        effect.material = .menu
-        effect.state = .active
-        effect.blendingMode = .behindWindow
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 12
-        effect.layer?.masksToBounds = true
-
-        hosting.frame = effect.bounds
+        hosting.frame = NSRect(x: 0, y: 0, width: width, height: height)
         hosting.autoresizingMask = [.width, .height]
-        hosting.wantsLayer = true
-        hosting.layer?.backgroundColor = NSColor.clear.cgColor
-        effect.addSubview(hosting)
-        panel.contentView = effect
+        panel.contentView = hosting
 
         let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         var x = buttonRect.midX - width / 2
@@ -289,6 +398,7 @@ final class PanelController: NSObject {
         panel.orderFrontRegardless()
         NSApp.activate()
         panel.makeKeyAndOrderFront(nil)
+        panel.invalidateShadow()
         self.panel = panel
 
         outsideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
