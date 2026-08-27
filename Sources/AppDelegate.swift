@@ -92,7 +92,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         flashStatus("Restoring \(space.displayName)…", seconds: 20)
 
         Task { @MainActor in
-            let result = await layouts.restore(layout, onto: space) { [weak self] target in
+            let result = await layouts.restore(
+                layout,
+                onto: space,
+                allSpaces: service.snapshot.allSpaces
+            ) { [weak self] target in
                 self?.service.select(target)
             }
             flashStatus(result.message, seconds: 4)
@@ -124,7 +128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 layouts.rekey(from: layout.spaceUUID, to: target.uuid)
             }
 
-            let result = await layouts.restore(layout, onto: target) { [weak self] space in
+            let result = await layouts.restore(
+                layout,
+                onto: target,
+                allSpaces: service.snapshot.allSpaces
+            ) { [weak self] space in
                 self?.service.select(space)
             }
             refreshLayoutState()

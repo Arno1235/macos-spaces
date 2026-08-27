@@ -180,9 +180,14 @@ final class LayoutEngine {
         return CaptureResult(windowCount: windows.count, appCount: Set(windows.map(\.bundleID)).count)
     }
 
-    func restore(_ layout: SavedLayout, onto space: Space, switchTo: @escaping (Space) -> Void) async -> RestoreResult {
+    func restore(
+        _ layout: SavedLayout,
+        onto space: Space,
+        allSpaces: [Space],
+        switchTo: @escaping (Space) -> Void
+    ) async -> RestoreResult {
         await MainActor.run { switchTo(space) }
-        try? await Task.sleep(nanoseconds: 450_000_000)
+        try? await Task.sleep(nanoseconds: 350_000_000)
 
         var launched = 0
         var launchedIDs: Set<String> = []
@@ -203,25 +208,72 @@ final class LayoutEngine {
             try? await Task.sleep(nanoseconds: 800_000_000)
         }
 
-        var placed = 0
-        var missed = 0
         var used = Set<CGWindowID>()
+        var assignments: [(saved: SavedWindow, live: LiveWindow)] = []
+        var live = capturableWindows(includeAX: false)
 
         for saved in layout.windows {
-            if let match = matchWindow(saved, on: space, excluding: used), let element = match.element {
+            if let match = matchWindow(saved, among: live, on: space, excluding: used) {
                 used.insert(match.windowID)
-                if !match.spaceIDs.contains(space.managedID) {
-                    CGSMoveWindowsToManagedSpace(connection, [NSNumber(value: match.windowID)] as CFArray, space.managedID)
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                }
-                setMinimized(element, saved.minimized)
-                setFrame(element, saved.frame)
-                placed += 1
-            } else {
-                missed += 1
+                assignments.append((saved, match))
             }
         }
 
+        WindowSpaceMover.move(assignments.map(\.live.windowID), to: space.managedID, connection: connection)
+        try? await Task.sleep(nanoseconds: 350_000_000)
+        await MainActor.run { switchTo(space) }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        let matchedBundles = Set(assignments.map(\.saved.bundleID))
+        let missingBundles = layout.bundleIDs.filter { !matchedBundles.contains($0) }
+        for bundleID in missingBundles {
+            openOnCurrentSpace(bundleID: bundleID)
+            launched += 1
+        }
+        if !missingBundles.isEmpty {
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            live = capturableWindows(includeAX: false)
+            let assignedSaved = Set(assignments.map(\.saved.windowID))
+            for saved in layout.windows where !assignedSaved.contains(saved.windowID) {
+                if let match = matchWindow(saved, among: live, on: space, excluding: used) {
+                    used.insert(match.windowID)
+                    assignments.append((saved, match))
+                }
+            }
+        }
+
+        let stillElsewhere = assignments.filter { assignment in
+            axElement(
+                pid: assignment.live.pid,
+                windowID: assignment.live.windowID,
+                title: assignment.saved.title,
+                frame: assignment.saved.frame
+            ) == nil
+        }
+        if !stillElsewhere.isEmpty {
+            await dragWindowsOntoSpace(stillElsewhere.map(\.live), target: space, allSpaces: allSpaces, switchTo: switchTo)
+            await MainActor.run { switchTo(space) }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        var placed = 0
+        for (saved, liveWindow) in assignments {
+            if let element = axElement(
+                pid: liveWindow.pid,
+                windowID: liveWindow.windowID,
+                title: saved.title,
+                frame: saved.frame
+            ) {
+                setMinimized(element, saved.minimized)
+                setFrame(element, saved.frame)
+                AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+                placed += 1
+            } else if liveWindow.spaceIDs.contains(space.managedID) {
+                placed += 1
+            }
+        }
+
+        let missed = max(0, layout.windows.count - placed)
         return RestoreResult(placed: placed, launched: launched, missed: missed)
     }
 
@@ -256,8 +308,139 @@ final class LayoutEngine {
         let pid: pid_t
     }
 
-    private func capturableWindows() -> [LiveWindow] {
-        guard let list = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+    private func openOnCurrentSpace(bundleID: String) {
+        if bundleID == "com.google.Chrome" {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            proc.arguments = ["-a", "Google Chrome", "--args", "--new-window"]
+            try? proc.run()
+            return
+        }
+        if bundleID == "com.apple.finder" {
+            NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser)
+            return
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in }
+    }
+
+    private func axElement(pid: pid_t, windowID: CGWindowID, title: String, frame: CGRect) -> AXUIElement? {
+        let byID = axWindows(pid: pid)
+        if let element = byID[windowID] { return element }
+
+        let app = AXUIElementCreateApplication(pid)
+        guard let windows: [AXUIElement] = axValue(app, kAXWindowsAttribute as String) else { return nil }
+        if !title.isEmpty {
+            let titled = windows.filter { axString($0, kAXTitleAttribute as String) == title }
+            if titled.count == 1 { return titled[0] }
+        }
+        if let closest = windows.min(by: { frameDistance(axFrame($0), frame) < frameDistance(axFrame($1), frame) }),
+           frameDistance(axFrame(closest), frame) < 80 {
+            return closest
+        }
+        return nil
+    }
+
+    private func frameDistance(_ a: CGRect?, _ b: CGRect) -> CGFloat {
+        guard let a else { return .greatestFiniteMagnitude }
+        return abs(a.midX - b.midX) + abs(a.midY - b.midY) + abs(a.width - b.width) + abs(a.height - b.height)
+    }
+
+    private func dragWindowsOntoSpace(
+        _ windows: [LiveWindow],
+        target: Space,
+        allSpaces: [Space],
+        switchTo: @escaping (Space) -> Void
+    ) async {
+        var remaining = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0) })
+        var byKnownSpace: [CGSSpaceID: [LiveWindow]] = [:]
+        var unknown: [LiveWindow] = []
+        for window in windows {
+            if let spaceID = window.spaceIDs.first(where: { id in allSpaces.contains(where: { $0.managedID == id }) }) {
+                byKnownSpace[spaceID, default: []].append(window)
+            } else {
+                unknown.append(window)
+            }
+        }
+
+        for space in allSpaces where !unknown.isEmpty && space.managedID != target.managedID {
+            await MainActor.run { switchTo(space) }
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            var found: [LiveWindow] = []
+            for window in unknown {
+                if axWindows(pid: window.pid)[window.windowID] != nil {
+                    found.append(window)
+                }
+            }
+            if !found.isEmpty {
+                byKnownSpace[space.managedID, default: []].append(contentsOf: found)
+                let foundIDs = Set(found.map(\.windowID))
+                unknown.removeAll { foundIDs.contains($0.windowID) }
+            }
+        }
+
+        let savedCursor = NSEvent.mouseLocation
+        for (spaceID, group) in byKnownSpace {
+            guard let source = allSpaces.first(where: { $0.managedID == spaceID }) else { continue }
+            for window in group {
+                guard remaining[window.windowID] != nil else { continue }
+                await dragWindow(window, from: source, to: target, switchTo: switchTo)
+                remaining.removeValue(forKey: window.windowID)
+            }
+        }
+        postMouse(.mouseMoved, at: quartzPoint(fromCocoa: savedCursor))
+    }
+
+    private func dragWindow(
+        _ window: LiveWindow,
+        from source: Space,
+        to target: Space,
+        switchTo: @escaping (Space) -> Void
+    ) async {
+        await MainActor.run { switchTo(source) }
+        try? await Task.sleep(nanoseconds: 320_000_000)
+
+        guard let element = axWindows(pid: window.pid)[window.windowID] ?? window.element else { return }
+        setMinimized(element, false)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        let frame = axFrame(element) ?? window.frame
+        let grab = grabPoint(for: frame)
+        let quartz = quartzPoint(fromCocoa: grab)
+
+        postMouse(.mouseMoved, at: quartz)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        postMouse(.leftMouseDown, at: quartz)
+        postMouse(.leftMouseDragged, at: CGPoint(x: quartz.x + 4, y: quartz.y))
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        await MainActor.run { switchTo(target) }
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        postMouse(.leftMouseUp, at: quartzPoint(fromCocoa: grabPoint(for: frame)))
+        try? await Task.sleep(nanoseconds: 80_000_000)
+    }
+
+    private func grabPoint(for frame: CGRect) -> CGPoint {
+        if frame.height < 80 {
+            return CGPoint(x: frame.midX, y: frame.midY)
+        }
+        return CGPoint(x: frame.midX, y: frame.maxY - 10)
+    }
+
+    private func quartzPoint(fromCocoa point: CGPoint) -> CGPoint {
+        let primary = NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main
+        let maxY = primary?.frame.maxY ?? 0
+        return CGPoint(x: point.x, y: maxY - point.y)
+    }
+
+    private func postMouse(_ type: CGEventType, at point: CGPoint) {
+        let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)
+        event?.post(tap: .cghidEventTap)
+    }
+
+    private func capturableWindows(includeAX: Bool = true) -> [LiveWindow] {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return []
         }
 
@@ -289,7 +472,7 @@ final class LayoutEngine {
                       bundleID != Bundle.main.bundleIdentifier,
                       !Self.ignoredBundleIDs.contains(bundleID) {
                 var axByID: [CGWindowID: AXUIElement] = [:]
-                if Self.isTrusted(prompt: false) {
+                if includeAX, Self.isTrusted(prompt: false) {
                     axByID = axWindows(pid: pid)
                 }
                 let created = (app, bundleID, axByID)
@@ -338,20 +521,28 @@ final class LayoutEngine {
         return ids.prefix(Int(count)).contains(displayID)
     }
 
-    private func matchWindow(_ saved: SavedWindow, on space: Space, excluding used: Set<CGWindowID>) -> LiveWindow? {
-        let candidates = capturableWindows().filter { $0.bundleID == saved.bundleID && !used.contains($0.windowID) }
-        func score(_ window: LiveWindow) -> Int {
-            let onSpace = window.spaceIDs.contains(space.managedID)
-            let titleMatch = !saved.title.isEmpty && window.title == saved.title
-            let idMatch = window.windowID == saved.windowID
-            var value = 0
-            if onSpace { value += 4 }
-            if window.spaceIDs.isEmpty { value += 1 }
-            if titleMatch { value += 2 }
-            if idMatch { value += 1 }
-            return value
+    private func matchWindow(
+        _ saved: SavedWindow,
+        among candidates: [LiveWindow],
+        on space: Space,
+        excluding used: Set<CGWindowID>
+    ) -> LiveWindow? {
+        let pool = candidates.filter { $0.bundleID == saved.bundleID && !used.contains($0.windowID) }
+        guard !pool.isEmpty else { return nil }
+        return pool.max { lhs, rhs in
+            let left = score(lhs, saved: saved, space: space)
+            let right = score(rhs, saved: saved, space: space)
+            if left != right { return left < right }
+            return frameDistance(lhs.frame, saved.frame) > frameDistance(rhs.frame, saved.frame)
         }
-        return candidates.max(by: { score($0) < score($1) }).flatMap { score($0) > 0 ? $0 : candidates.first }
+    }
+
+    private func score(_ window: LiveWindow, saved: SavedWindow, space: Space) -> Int {
+        var value = 1
+        if window.windowID == saved.windowID { value += 8 }
+        if !saved.title.isEmpty, window.title == saved.title { value += 4 }
+        if window.spaceIDs.contains(space.managedID) { value += 2 }
+        return value
     }
 
     private func waitForApps(bundleIDs: Set<String>, timeout: TimeInterval) async {
