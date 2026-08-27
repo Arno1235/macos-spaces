@@ -63,6 +63,36 @@ final class SpaceService: ObservableObject {
         refresh(force: true)
     }
 
+    func rename(uuid: String, to name: String) {
+        store.setName(name, for: uuid)
+        refresh(force: true)
+    }
+
+    @discardableResult
+    func reload() -> SpaceSnapshot {
+        let next = readSnapshot()
+        snapshot = next
+        return next
+    }
+
+    func addDesktop(on displayID: String?) async -> Space? {
+        let previous = Set(snapshot.allSpaces.map(\.uuid))
+        let added = await MissionControl.addDesktop(onDisplay: displayID)
+        guard added else { return nil }
+        for _ in 0..<24 {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            let snap = reload()
+            let newcomers = snap.allSpaces.filter { !previous.contains($0.uuid) && !$0.isFullScreen }
+            if let displayID, let match = newcomers.first(where: { $0.displayID == displayID }) {
+                return match
+            }
+            if let last = newcomers.last {
+                return last
+            }
+        }
+        return nil
+    }
+
     func select(_ space: Space) {
         let needsSwitch = !space.isCurrentOnDisplay
         if needsSwitch {

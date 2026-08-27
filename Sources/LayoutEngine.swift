@@ -20,6 +20,7 @@ struct SavedWindow: Codable, Equatable {
 struct SavedLayout: Codable, Equatable {
     var spaceUUID: String
     var spaceName: String
+    var displayID: String?
     var savedAt: Date
     var windows: [SavedWindow]
 
@@ -32,7 +33,11 @@ struct SavedLayout: Codable, Equatable {
     }
 }
 
-struct LayoutSummary: Equatable {
+struct LayoutSummary: Equatable, Identifiable {
+    var id: String { spaceUUID }
+    var spaceUUID: String
+    var spaceName: String
+    var displayID: String?
     var savedAt: Date
     var windowCount: Int
     var bundleIDs: [String]
@@ -75,12 +80,39 @@ final class LayoutEngine {
     }
 
     func summary(for spaceUUID: String) -> LayoutSummary? {
-        guard let layout = layouts[spaceUUID] else { return nil }
-        return LayoutSummary(savedAt: layout.savedAt, windowCount: layout.windows.count, bundleIDs: layout.bundleIDs)
+        layouts[spaceUUID].map(Self.summary(from:))
     }
 
     func summaries() -> [String: LayoutSummary] {
-        Dictionary(uniqueKeysWithValues: layouts.map { ($0.key, LayoutSummary(savedAt: $0.value.savedAt, windowCount: $0.value.windows.count, bundleIDs: $0.value.bundleIDs)) })
+        Dictionary(uniqueKeysWithValues: layouts.map { ($0.key, Self.summary(from: $0.value)) })
+    }
+
+    func layout(for spaceUUID: String) -> SavedLayout? {
+        layouts[spaceUUID]
+    }
+
+    func removeLayout(for spaceUUID: String) {
+        layouts.removeValue(forKey: spaceUUID)
+        save()
+    }
+
+    func rekey(from oldUUID: String, to newUUID: String) {
+        guard var layout = layouts[oldUUID] else { return }
+        layouts.removeValue(forKey: oldUUID)
+        layout.spaceUUID = newUUID
+        layouts[newUUID] = layout
+        save()
+    }
+
+    private static func summary(from layout: SavedLayout) -> LayoutSummary {
+        LayoutSummary(
+            spaceUUID: layout.spaceUUID,
+            spaceName: layout.spaceName,
+            displayID: layout.displayID,
+            savedAt: layout.savedAt,
+            windowCount: layout.windows.count,
+            bundleIDs: layout.bundleIDs
+        )
     }
 
     static func isTrusted(prompt: Bool) -> Bool {
@@ -137,6 +169,7 @@ final class LayoutEngine {
         layouts[space.uuid] = SavedLayout(
             spaceUUID: space.uuid,
             spaceName: space.displayName,
+            displayID: space.displayID,
             savedAt: Date(),
             windows: windows
         )
@@ -144,11 +177,7 @@ final class LayoutEngine {
         return CaptureResult(windowCount: windows.count, appCount: Set(windows.map(\.bundleID)).count)
     }
 
-    func restore(_ space: Space, switchTo: @escaping (Space) -> Void) async -> RestoreResult {
-        guard let layout = layouts[space.uuid] else {
-            return RestoreResult(placed: 0, launched: 0, missed: 0)
-        }
-
+    func restore(_ layout: SavedLayout, onto space: Space, switchTo: @escaping (Space) -> Void) async -> RestoreResult {
         await MainActor.run { switchTo(space) }
         try? await Task.sleep(nanoseconds: 450_000_000)
 
@@ -191,6 +220,23 @@ final class LayoutEngine {
         }
 
         return RestoreResult(placed: placed, launched: launched, missed: missed)
+    }
+
+    func inferredDisplayID(for layout: SavedLayout) -> String? {
+        if let stored = layout.displayID, NSScreen.screens.contains(where: { $0.displayUUID == stored }) {
+            return stored
+        }
+        for window in layout.windows where window.width > 200 && window.height > 200 {
+            var count: UInt32 = 0
+            var ids = [CGDirectDisplayID](repeating: 0, count: 8)
+            CGGetDisplaysWithRect(window.frame, 8, &ids, &count)
+            if let display = ids.prefix(Int(count)).compactMap({ id in
+                NSScreen.screens.first(where: { $0.cgDisplayID == id })?.displayUUID
+            }).first {
+                return display
+            }
+        }
+        return nil
     }
 
     // MARK: - Capture internals

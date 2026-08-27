@@ -6,12 +6,15 @@ final class PanelModel: ObservableObject {
     @Published var loginEnabled = LoginItem.isEnabled
     @Published var liveApps: [String: [String]] = [:]
     @Published var savedLayouts: [String: LayoutSummary] = [:]
+    @Published var closedLayouts: [LayoutSummary] = []
     @Published var statusMessage: String?
 
     var onRename: ((Space, String) -> Void)?
     var onSelect: ((Space) -> Void)?
     var onSave: ((Space) -> Void)?
     var onRestore: ((Space) -> Void)?
+    var onReopenClosed: ((LayoutSummary) -> Void)?
+    var onForgetClosed: ((LayoutSummary) -> Void)?
     var onToggleLogin: (() -> Void)?
     var onQuit: (() -> Void)?
 }
@@ -174,6 +177,9 @@ struct SpacesPanelView: View {
                     ForEach(model.snapshot.displays) { display in
                         displaySection(display)
                     }
+                    if !model.closedLayouts.isEmpty {
+                        closedSection
+                    }
                 }
             }
             .frame(maxHeight: 420)
@@ -243,9 +249,62 @@ struct SpacesPanelView: View {
         }
     }
 
+    private var closedSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Closed spaces")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 10)
+
+            ForEach(model.closedLayouts) { layout in
+                HStack(spacing: 8) {
+                    Image(systemName: "archivebox")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(layout.spaceName)
+                            .font(.system(size: 13, weight: .medium))
+                            .lineLimit(1)
+                        Text("\(layout.windowCount) window\(layout.windowCount == 1 ? "" : "s") saved")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    AppIconStack(bundleIDs: layout.bundleIDs)
+
+                    Button {
+                        model.onReopenClosed?(layout)
+                    } label: {
+                        Text("Reopen")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Create a new Space and restore the saved apps")
+
+                    Button {
+                        model.onForgetClosed?(layout)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove this saved layout")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
+        }
+    }
+
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Save stores the apps and window layout on that Space. Restore launches them again.")
+            Text("Save stores apps and window layout. If you close a Space, it appears under Closed spaces so you can reopen it.")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)

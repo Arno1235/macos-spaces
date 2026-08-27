@@ -33,6 +33,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.model.onRestore = { [weak self] space in
             self?.restoreLayout(of: space)
         }
+        panel.model.onReopenClosed = { [weak self] summary in
+            self?.reopenClosed(summary)
+        }
+        panel.model.onForgetClosed = { [weak self] summary in
+            self?.layouts.removeLayout(for: summary.spaceUUID)
+            self?.refreshLayoutState()
+            self?.panel.model.statusMessage = "Removed saved \(summary.spaceName)"
+        }
         panel.model.onToggleLogin = {
             LoginItem.setEnabled(!LoginItem.isEnabled)
         }
@@ -76,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restoreLayout(of space: Space) {
-        guard layouts.summary(for: space.uuid) != nil else { return }
+        guard let layout = layouts.layout(for: space.uuid) else { return }
         guard ensureAccessibility() else { return }
 
         panel.close()
@@ -84,15 +92,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         flashStatus("Restoring \(space.displayName)…", seconds: 20)
 
         Task { @MainActor in
-            let result = await layouts.restore(space) { [weak self] target in
+            let result = await layouts.restore(layout, onto: space) { [weak self] target in
                 self?.service.select(target)
             }
             flashStatus(result.message, seconds: 4)
         }
     }
 
+    private func reopenClosed(_ summary: LayoutSummary) {
+        guard let layout = layouts.layout(for: summary.spaceUUID) else { return }
+        guard ensureAccessibility() else { return }
+
+        panel.close()
+        frozenFocusedUUID = nil
+        flashStatus("Reopening \(summary.spaceName)…", seconds: 30)
+
+        Task { @MainActor in
+            let displayID = layouts.inferredDisplayID(for: layout)
+                ?? service.snapshot.focusedSpace?.displayID
+            let created = await service.addDesktop(on: displayID)
+            let target = created
+                ?? service.snapshot.focusedSpace
+                ?? service.snapshot.allSpaces.first
+            guard let target else {
+                flashStatus("Could not reopen \(summary.spaceName)", seconds: 4)
+                return
+            }
+
+            if created != nil {
+                service.rename(uuid: target.uuid, to: layout.spaceName)
+                layouts.rekey(from: layout.spaceUUID, to: target.uuid)
+            }
+
+            let result = await layouts.restore(layout, onto: target) { [weak self] space in
+                self?.service.select(space)
+            }
+            refreshLayoutState()
+            if created != nil {
+                flashStatus("Reopened \(layout.spaceName) · \(result.message)", seconds: 5)
+            } else {
+                flashStatus("Opened on current Space · \(result.message)", seconds: 5)
+            }
+        }
+    }
+
     private func refreshLayoutState() {
-        panel.model.savedLayouts = layouts.summaries()
+        let live = Set(service.snapshot.allSpaces.map(\.uuid))
+        let all = layouts.summaries()
+        panel.model.savedLayouts = all.filter { live.contains($0.key) }
+        panel.model.closedLayouts = all.values
+            .filter { !live.contains($0.spaceUUID) }
+            .sorted { $0.savedAt > $1.savedAt }
         panel.model.liveApps = layouts.liveBundleIDs(in: service.snapshot.allSpaces)
     }
 
