@@ -147,20 +147,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func ensureAccessibility() -> Bool {
-        if LayoutEngine.isTrusted(prompt: false) { return true }
-        _ = LayoutEngine.isTrusted(prompt: true)
+        if LayoutEngine.isTrusted() { return true }
 
         let alert = NSAlert()
         alert.messageText = "Spaces needs Accessibility permission"
-        alert.informativeText = "Restoring window layouts requires moving and resizing other apps. Enable Spaces in System Settings → Privacy & Security → Accessibility, then try Restore again."
+        alert.informativeText = """
+        Restore and Reopen need permission to move windows and create desktops.
+
+        In System Settings → Privacy & Security → Accessibility:
+        1. If Spaces is already listed, turn it off, select it, and click −.
+        2. Click +, press Shift-Command-G, and choose ~/Applications/Spaces.app.
+        3. Turn the toggle on, then click Relaunch Spaces.
+
+        The toggle you already enabled was for an older unsigned build, so macOS still blocks this copy.
+        """
         alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Relaunch Spaces")
         alert.addButton(withTitle: "Later")
         NSApp.activate()
-        if alert.runModal() == .alertFirstButtonReturn,
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn,
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
+            return false
         }
-        return LayoutEngine.isTrusted(prompt: false)
+        if response == .alertSecondButtonReturn {
+            relaunch()
+            return false
+        }
+        return false
+    }
+
+    private func relaunch() {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        proc.arguments = ["-n", Bundle.main.bundlePath]
+        try? proc.run()
+        proc.waitUntilExit()
+        NSApp.terminate(nil)
     }
 
     private func flashStatus(_ text: String, seconds: TimeInterval) {

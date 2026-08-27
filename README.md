@@ -24,4 +24,6 @@ This uses private WindowServer APIs (`SkyLight`) to read and switch Spaces. Appl
 open build/Spaces.app
 ```
 
-The app is a menu bar extra (no Dock icon). Click the Space name in the menu bar to rename desktops or switch to one. Use the download icon to save that Space's apps and window positions, and the reload icon to bring them back. If you close the desktop in Mission Control, it stays listed under **Closed spaces** — Reopen creates a new desktop and launches the saved apps. Restore will ask for Accessibility permission the first time. Enable **Launch at login** if you want the app to start on its own.
+The app is a menu bar extra (no Dock icon). Click the Space name in the menu bar to rename desktops or switch to one. Use the download icon to save that Space's apps and window positions, and the reload icon to bring them back. If you close the desktop in Mission Control, it stays listed under **Closed spaces** — Reopen creates a new desktop and launches the saved apps.
+
+`./build.sh` installs `~/Applications/Spaces.app`. Restore needs Accessibility permission; after a rebuild, if macOS still prompts, remove the old Spaces entry and add this copy again. Enable **Launch at login** if you want the app to start on its own.
