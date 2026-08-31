@@ -22,6 +22,11 @@ struct Space: Identifiable, Equatable {
         if let customName, !customName.isEmpty { return customName }
         return defaultName
     }
+
+    var hasCustomName: Bool {
+        guard let customName else { return false }
+        return !customName.isEmpty
+    }
 }
 
 struct DisplayInfo: Identifiable, Equatable {

@@ -8,6 +8,8 @@ final class PanelModel: ObservableObject {
     @Published var savedLayouts: [String: LayoutSummary] = [:]
     @Published var closedLayouts: [LayoutSummary] = []
     @Published var statusMessage: String?
+    /// Bumped after the panel becomes key so an unnamed current Space can take name-field focus.
+    @Published var nameFieldAutoFocusGeneration = 0
 
     var onRename: ((Space, String) -> Void)?
     var onSelect: ((Space) -> Void)?
@@ -58,9 +60,13 @@ struct SpaceRow: View {
     let onSelect: () -> Void
     let onSave: () -> Void
     let onRestore: () -> Void
+    @FocusState.Binding var focusedSpaceID: String?
 
     @State private var draft = ""
-    @FocusState private var fieldFocused: Bool
+
+    private var fieldFocused: Bool {
+        focusedSpaceID == space.uuid
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -76,9 +82,9 @@ struct SpaceRow: View {
             TextField(space.defaultName, text: $draft)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13, weight: space.isFocused ? .semibold : .regular))
-                .focused($fieldFocused)
+                .focused($focusedSpaceID, equals: space.uuid)
                 .onSubmit { commit() }
-                .onExitCommand { fieldFocused = false; commit() }
+                .onExitCommand { focusedSpaceID = nil; commit() }
 
             AppIconStack(bundleIDs: liveApps)
 
@@ -131,9 +137,12 @@ struct SpaceRow: View {
                 draft = value ?? ""
             }
         }
-        .onChange(of: fieldFocused) { _, focused in
-            if !focused { commit() }
+        .onChange(of: focusedSpaceID) { oldValue, newValue in
+            if oldValue == space.uuid && newValue != space.uuid {
+                commit()
+            }
         }
+        .onDisappear { commit() }
     }
 
     private var restoreHelp: String {
@@ -165,24 +174,43 @@ struct SpaceRow: View {
 
 struct SpacesPanelView: View {
     @ObservedObject var model: PanelModel
+    @FocusState private var focusedSpaceID: String?
+    private let autoFocusUUID: String?
 
     private let cornerRadius: CGFloat = 14
+
+    init(model: PanelModel) {
+        self.model = model
+        if let space = model.snapshot.focusedSpace, !space.hasCustomName {
+            autoFocusUUID = space.uuid
+        } else {
+            autoFocusUUID = nil
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    ForEach(model.snapshot.displays) { display in
-                        displaySection(display)
-                    }
-                    if !model.closedLayouts.isEmpty {
-                        closedSection
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(model.snapshot.displays) { display in
+                            displaySection(display)
+                        }
+                        if !model.closedLayouts.isEmpty {
+                            closedSection
+                        }
                     }
                 }
+                .frame(maxHeight: 420)
+                .onAppear {
+                    focusUnnamedCurrentSpace(scroll: proxy)
+                }
+                .onChange(of: model.nameFieldAutoFocusGeneration) { _, _ in
+                    focusUnnamedCurrentSpace(scroll: proxy)
+                }
             }
-            .frame(maxHeight: 420)
 
             Divider()
 
@@ -199,6 +227,17 @@ struct SpacesPanelView: View {
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .defaultFocusWhenPresent($focusedSpaceID, autoFocusUUID)
+    }
+
+    private func focusUnnamedCurrentSpace(scroll: ScrollViewProxy) {
+        guard let uuid = autoFocusUUID else { return }
+        Task { @MainActor in
+            // Let the panel become key and the text field enter the focus system.
+            try? await Task.sleep(for: .milliseconds(50))
+            scroll.scrollTo(uuid, anchor: .center)
+            focusedSpaceID = uuid
+        }
     }
 
     private var header: some View {
@@ -243,8 +282,10 @@ struct SpacesPanelView: View {
                     onRename: { model.onRename?(space, $0) },
                     onSelect: { model.onSelect?(space) },
                     onSave: { model.onSave?(space) },
-                    onRestore: { model.onRestore?(space) }
+                    onRestore: { model.onRestore?(space) },
+                    focusedSpaceID: $focusedSpaceID
                 )
+                .id(space.uuid)
             }
         }
     }
@@ -341,11 +382,24 @@ struct SpacesPanelView: View {
     }
 }
 
+private extension View {
+    @ViewBuilder
+    func defaultFocusWhenPresent(_ binding: FocusState<String?>.Binding, _ value: String?) -> some View {
+        if let value {
+            defaultFocus(binding, value)
+        } else {
+            self
+        }
+    }
+}
+
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
 final class TransparentHostingView<Content: View>: NSHostingView<Content> {
+    override var acceptsFirstResponder: Bool { true }
+
     required init(rootView: Content) {
         super.init(rootView: rootView)
         configure()
@@ -459,6 +513,12 @@ final class PanelController: NSObject {
         panel.makeKeyAndOrderFront(nil)
         panel.invalidateShadow()
         self.panel = panel
+
+        if let space = model.snapshot.focusedSpace, !space.hasCustomName {
+            DispatchQueue.main.async { [weak self] in
+                self?.model.nameFieldAutoFocusGeneration += 1
+            }
+        }
 
         outsideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let self, let button = self.statusItem?.button, let window = button.window else {
