@@ -2,6 +2,14 @@
 
 Menu bar app that names macOS desktop Spaces and shows the name of the Space on the display that currently has focus.
 
+<p align="center">
+  <img src="docs/screenshot-panel.png" alt="Spaces menu with named desktops, app icons, and layout save buttons" width="480">
+</p>
+
+<p align="center">
+  <img src="docs/screenshot-menubar.png" alt="Menu bar showing the current Space name" width="880">
+</p>
+
 ## Features
 
 - The menu bar title is the custom name of the focused display's current Space (or `Desktop N` until you name it).
