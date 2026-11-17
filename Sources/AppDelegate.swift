@@ -4,6 +4,7 @@ import Combine
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = NameStore()
     private lazy var service = SpaceService(store: store)
+    private lazy var tracker = DisplayTracker(store: store)
     private let layouts = LayoutEngine()
     private let panel = PanelController()
     private var statusItem: NSStatusItem?
@@ -45,6 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshLayoutState()
             self?.panel.model.statusMessage = "Removed saved \(summary.spaceName)"
         }
+        panel.model.onForgetAway = { [weak self] away in
+            self?.tracker.forget(away.uuid)
+        }
+        panel.model.onToggleTracking = { [weak self] in
+            guard let self else { return }
+            self.tracker.isEnabled.toggle()
+            self.tracker.observe(self.latestSnapshot)
+        }
+        tracker.onChange = { [weak self] in
+            self?.refreshTrackingState()
+        }
         panel.model.onToggleLogin = {
             LoginItem.setEnabled(!LoginItem.isEnabled)
         }
@@ -66,14 +78,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] snapshot in
                 guard let self else { return }
                 self.latestSnapshot = snapshot
+                self.tracker.observe(snapshot)
                 let presented = snapshot.pinningFocus(to: self.frozenFocusedUUID)
                 self.panel.model.snapshot = presented
+                let merges = self.tracker.isEnabled ? DisplayTracker.mergeCandidates(in: snapshot) : [:]
+                if self.panel.model.mergesOnUnplug != merges {
+                    self.panel.model.mergesOnUnplug = merges
+                }
                 self.updateStatusItem(presented)
             }
             .store(in: &cancellables)
 
+        refreshTrackingState()
         refreshLayoutState()
         updateStatusItem(service.snapshot)
+    }
+
+    private func refreshTrackingState() {
+        let model = panel.model
+        model.trackingEnabled = tracker.isEnabled
+        if tracker.isEnabled {
+            model.awaySpaces = tracker.away.values.sorted { $0.since > $1.since }
+            model.parkedHomes = tracker.parked.mapValues(\.homeDisplayName)
+            model.mergesOnUnplug = DisplayTracker.mergeCandidates(in: latestSnapshot)
+        } else {
+            model.awaySpaces = []
+            model.parkedHomes = [:]
+            model.mergesOnUnplug = [:]
+        }
+        updateLayoutLists()
     }
 
     private func saveLayout(of space: Space) {
@@ -150,13 +183,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshLayoutState() {
+        updateLayoutLists()
+        panel.model.liveApps = layouts.liveBundleIDs(in: service.snapshot.allSpaces)
+    }
+
+    private func updateLayoutLists() {
         let live = Set(service.snapshot.allSpaces.map(\.uuid))
+        // A merged Space that macOS will bring back with its display is not closed.
+        let away = tracker.isEnabled ? Set(tracker.away.keys) : []
         let all = layouts.summaries()
         panel.model.savedLayouts = all.filter { live.contains($0.key) }
         panel.model.closedLayouts = all.values
-            .filter { !live.contains($0.spaceUUID) }
+            .filter { !live.contains($0.spaceUUID) && !away.contains($0.spaceUUID) }
             .sorted { $0.savedAt > $1.savedAt }
-        panel.model.liveApps = layouts.liveBundleIDs(in: service.snapshot.allSpaces)
     }
 
     private func ensureAccessibility() -> Bool {

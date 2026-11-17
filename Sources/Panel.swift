@@ -10,6 +10,12 @@ final class PanelModel: ObservableObject {
     @Published var statusMessage: String?
     /// Bumped after the panel becomes key so an unnamed current Space can take name-field focus.
     @Published var nameFieldAutoFocusGeneration = 0
+    @Published var trackingEnabled = true
+    @Published var awaySpaces: [AwaySpace] = []
+    /// Space UUID → name of the unplugged display it returns to.
+    @Published var parkedHomes: [String: String] = [:]
+    /// Space UUID → where macOS merges this desktop when displays are unplugged.
+    @Published var mergesOnUnplug: [String: MergeRisk] = [:]
 
     var onRename: ((Space, String) -> Void)?
     var onSelect: ((Space) -> Void)?
@@ -17,6 +23,8 @@ final class PanelModel: ObservableObject {
     var onRestore: ((Space) -> Void)?
     var onReopenClosed: ((LayoutSummary) -> Void)?
     var onForgetClosed: ((LayoutSummary) -> Void)?
+    var onForgetAway: ((AwaySpace) -> Void)?
+    var onToggleTracking: (() -> Void)?
     var onToggleLogin: (() -> Void)?
     var onQuit: (() -> Void)?
 }
@@ -56,6 +64,8 @@ struct SpaceRow: View {
     let space: Space
     let liveApps: [String]
     let saved: LayoutSummary?
+    var parkedHome: String?
+    var mergeRisk: MergeRisk?
     let onRename: (String) -> Void
     let onSelect: () -> Void
     let onSave: () -> Void
@@ -87,6 +97,20 @@ struct SpaceRow: View {
                 .onExitCommand { focusedSpaceID = nil; commit() }
 
             AppIconStack(bundleIDs: liveApps)
+
+            if let parkedHome {
+                Image(systemName: "arrow.uturn.backward.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .help("Parked here while \(parkedHome) is disconnected. macOS moves it back when that display is connected again.")
+            }
+
+            if let mergeRisk, !liveApps.isEmpty {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .help("When displays are disconnected, macOS merges this desktop's windows into “\(mergeRisk.targetName)”, the first desktop on \(mergeRisk.targetDisplayName). They move back when the display is connected again. Keep this desktop empty and nothing gets merged; the other desktops are kept as they are.")
+            }
 
             if space.isFocused {
                 Text("Focus")
@@ -198,6 +222,9 @@ struct SpacesPanelView: View {
                         ForEach(model.snapshot.displays) { display in
                             displaySection(display)
                         }
+                        if model.trackingEnabled, !model.awaySpaces.isEmpty {
+                            awaySection
+                        }
                         if !model.closedLayouts.isEmpty {
                             closedSection
                         }
@@ -279,6 +306,8 @@ struct SpacesPanelView: View {
                     space: space,
                     liveApps: model.liveApps[space.uuid] ?? [],
                     saved: model.savedLayouts[space.uuid],
+                    parkedHome: model.trackingEnabled ? model.parkedHomes[space.uuid] : nil,
+                    mergeRisk: model.trackingEnabled ? model.mergesOnUnplug[space.uuid] : nil,
                     onRename: { model.onRename?(space, $0) },
                     onSelect: { model.onSelect?(space) },
                     onSave: { model.onSave?(space) },
@@ -288,6 +317,70 @@ struct SpacesPanelView: View {
                 .id(space.uuid)
             }
         }
+    }
+
+    private var awaySection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Unplugged displays")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 10)
+
+            ForEach(model.awaySpaces) { away in
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.triangle.merge")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(awayName(away))
+                            .font(.system(size: 13, weight: .medium))
+                            .lineLimit(1)
+                        Text(awayDetail(away))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(2)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    AppIconStack(bundleIDs: away.bundleIDs)
+
+                    Button {
+                        model.onForgetAway?(away)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stop showing this. macOS still brings it back if the display returns.")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .help("macOS merged this desktop when \(away.displayName) was disconnected. It recreates it, with its name, when that display is connected again, and moves back the windows you haven't closed or moved to another desktop.")
+            }
+        }
+    }
+
+    private func awayName(_ away: AwaySpace) -> String {
+        if let live = model.snapshot.allSpaces.first(where: { $0.uuid == away.uuid }) {
+            return live.displayName
+        }
+        if let name = away.name, !name.isEmpty { return name }
+        return "Desktop"
+    }
+
+    private func awayDetail(_ away: AwaySpace) -> String {
+        var parts: [String] = []
+        if let target = away.mergedIntoUUID.flatMap({ model.snapshot.space(uuid: $0) }) {
+            let count = away.windowCount
+            parts.append("\(count) window\(count == 1 ? "" : "s") merged into \(target.displayName)")
+        }
+        parts.append("returns with \(away.displayName)")
+        return parts.joined(separator: " · ")
     }
 
     private var closedSection: some View {
@@ -349,6 +442,21 @@ struct SpacesPanelView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                model.onToggleTracking?()
+            } label: {
+                HStack {
+                    Image(systemName: model.trackingEnabled ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(model.trackingEnabled ? Color.accentColor : Color.secondary)
+                    Text("Track unplugged displays")
+                    Spacer()
+                }
+                .font(.system(size: 12))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show which desktops macOS merged or moved when a display was unplugged, and which ones it will merge.")
 
             Button {
                 model.onToggleLogin?()
